@@ -1,0 +1,532 @@
+---
+title: "Download and process MRI - UKB data"
+author: "by [Baptiste Couvy-Duchesne] - `r format(Sys.time(), '%d %B %Y')`"
+output:
+  epuRate::PCTG:
+    toc: TRUE
+    code_folding: "show"
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# You need these libraries to run this template:
+library(rmarkdown)    # install.packages("rmarkdown") 
+library(epuRate)      # devtools::install_github("holtzy/epuRate", force=TRUE)
+library(reticulate) # install.packages("reticulate") 
+
+```
+
+# Create environment, useful paths and bits of code
+
+```{bash, eval=F, message=FALSE}
+
+mkdir -p ${wd}/3_MRI_download # UKB dowloaded data
+mkdir -p ${wd}/4_rawMRI_unzip # Folder to unzip individual MRI
+mkdir -p ${wd}/5_MRI_BIDSformat # BIDS folder for T1w images
+
+
+```
+
+
+# Install clinica and set up environment
+
+Infos here: <https://aramislab.paris.inria.fr/clinica/docs/public/latest/Third-party/>
+
+```{bash, eval=F, message=FALSE}
+
+module load miniconda3/4.12.0
+conda create --name clinicaEnv python=3.8
+conda activate clinicaEnv
+pip install clinica
+
+# Load matlab and clinica
+module load matlab/R2022a6
+conda activate clinicaEnv
+
+
+# Copy filed created by Clara as clinical_data.csv
+# File /Neuroimaging_ML_project/clinical_data.csv is the participant csv required by clinica
+
+
+# Add Matlab dependency to bash_profile 
+vi ~/.bash_profile 
+
+# Add the following lines to bash profile
+#MATLAB
+export MATLAB_HOME="/sw/local/rocky8.6/noarch/rcc/software/MATLAB/R2022a6/bin"
+export PATH=${MATLAB_HOME}:${PATH}
+export MATLABCMD="${MATLAB_HOME}/matlab"
+
+# Install and add paths for dcm2niix
+# Install dcm2niix using the pip : python -m pip install dcm2niix
+export PATH=$PATH:/home/uqbcouvy/.local/bin
+
+# Install SPM  12 and add path to bash_profile
+export SPM_HOME="/path/to/spm12
+
+```
+
+
+# Format UKB data into the bids (reference) format 
+
+> This reorganises the images in a standard folder structure
+
+```{bash, eval=F, message=FALSE}
+
+
+wd="/path/to/working/directory/Neuroimaging_ML_project/"
+cd $wd
+
+# Run in an interactive job
+clinica convert ukb-to-bids ${wd}/3_MRI_download/Allbatch ${wd} ${wd}/5_MRI_BIDSformat
+
+# Count the number of nifti images converted
+ls ${wd}/5_MRI_BIDSformat/*/*/*/*nii.gz | wc -l # 4921 images
+
+```
+
+# Check that the missing nifti in bids are from "unusable" folders (deemed unusable by the UKB)
+
+```{R, eval=F, message=FALSE}
+
+allIndivs=fread(paste0("/path/to/working/directoryNeuroimaging_ML_project/clinical_data.csv"), header = T)
+
+bids=fread(paste0("/path/to/working/directoryNeuroimaging_ML_project/5_MRI_BIDSformat/participants.tsv"), header = T)
+
+allIndivs$eid[-which(allIndivs$eid %in% bids$source_id)]
+
+# Confirmed that T1 are labelled unusable - 79 individuals 
+```
+
+
+# T1-volume processing
+
+## First step - center images
+
+> If you are trying to launch the t1-freesurfer pipeline, you can ignore this message if you do not want to run the pet-surface pipeline afterward.
+Clinica provides a tool to counter this problem by replacing the center of the volume at the origin of the world coordinates.
+Use the following command line to correct the header of the faulty NIFTI volumes in a new folder:
+clinica iotools center-nifti /network/lustre/dtlake01/aramis/datasets/ukbiobank/bids /network/lustre/dtlake01/aramis/datasets/ukbiobank/bids_centered --modality "t1w"
+
+```{bash, eval=F, message=FALSE}
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/5_MRI_BIDSformat" 
+mkdir -p /path/to/working/directory/Neuroimaging_ML_project/6_bids_centered
+cd ${BIDS_DIR}
+
+module load miniconda3/4.12.0
+conda activate clinicaEnv1
+
+# Submit as an array job
+# we need to source the conda.sh file to make it available in all arrays
+${bin}/qsubshcom " module load matlab/R2022a6 |;
+module load miniconda3/4.12.0 |;
+source /sw/auto/rocky8c/epyc3/software/Miniconda3/4.12.0/etc/profile.d/conda.sh |;
+conda activate clinicaEnv |;
+clinica iotools center-nifti ${BIDS_DIR} /path/to/working/directory/Neuroimaging_ML_project/6_bids_centered --modality "t1w" |; " 1 15G UKB_BIDS_centered_ 10:00:00 "--account=a_mcrae --partition=general"
+ 
+ 
+```
+
+
+# Step2 - Tissue segmentation module 
+
+> TEST on 10 indiviudals
+
+```{bash, eval=F, message=FALSE}
+
+mkdir -p /path/to/working/directory/Neuroimaging_ML_project/7_caps
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+cd ${CAPS_DIR}
+conda activate clinicaEnv
+
+${bin}/qsubshcom "  module load matlab/R2022a6 |;
+module load miniconda3/4.12.0 |;
+source /sw/auto/rocky8c/epyc3/software/Miniconda3/4.12.0/etc/profile.d/conda.sh |;
+conda activate clinicaEnv |;
+dat=\$(sed -n \"\${TASK_ID}{p;q}\" ${BIDS_DIR}/participants.tsv) |;
+echo \${dat} |;
+ID=\$(echo \${dat} | cut -f 1 -d ' ' ) |;
+echo \${ID} |;
+if [ -d ${CAPS_DIR}/subjects/${ID}/ses-M000/t1/spm/segmentation/normalized_space ] |;
+then |;
+nb=\$(ls ${CAPS_DIR}/subjects/\${ID}/ses-M000/t1/spm/segmentation/normalized_space | wc -l) |;
+if [ \${nb} -lt 6 ] |;
+then |;
+echo \"T1 t1-volume-tissue-segmentation - RUNNING\" |;
+colnames=\$(head -n 1 ${BIDS_DIR}/participants.tsv) |;
+echo \${colnames} \"session_id\" | tr ' ' '\t' > ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+echo \${dat} \"ses-M000\" | tr ' ' '\t' >> ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+head ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+clinica run t1-volume-tissue-segmentation ${BIDS_DIR} ${CAPS_DIR} -tsv ${BIDS_DIR}/participants_\${TASK_ID}.tsv -np 1 -wd \${TMPDIR} |;
+rm ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+else |;
+echo \"T1 volume tissue segmentation output found - STOP\" |;
+fi |;
+else |;
+echo \"T1 t1-volume-tissue-segmentation - RUNNING\" |;
+colnames=\$(head -n 1 ${BIDS_DIR}/participants.tsv) |;
+echo \${colnames} \"session_id\" | tr ' ' '\t' > ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+echo \${dat} \"ses-M000\" | tr ' ' '\t' >> ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+head ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+clinica run t1-volume-tissue-segmentation ${BIDS_DIR} ${CAPS_DIR} -tsv ${BIDS_DIR}/participants_\${TASK_ID}.tsv -np 1 -wd \${TMPDIR} |;
+rm ${BIDS_DIR}/participants_\${TASK_ID}.tsv |;
+fi |;  " 1 4G UKB_T1vol_A_Clinica 10:00:00 "-array=1-10 --account=a_mcrae --partition=general"
+
+
+```
+
+# Problem with sbatch (array seems capped at 1000)
+
+> I divided the list of individuals into 5 chunks and submited them as 5 array jobs of < 1000 arrays
+
+```{bash, eval=F, message=FALSE}
+
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+cd ${CAPS_DIR}
+conda activate clinicaEnv
+
+# Split participant TSV
+split -l$((`wc -l < ${BIDS_DIR}/participants.tsv`/5)) ${BIDS_DIR}/participants.tsv ${BIDS_DIR}/participants_batch -da 1
+head ${BIDS_DIR}/participants_batch5 >> ${BIDS_DIR}/participants_batch4
+rm ${BIDS_DIR}/participants_batch5
+
+
+
+
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+cd ${CAPS_DIR}
+conda activate clinicaEnv
+
+
+for batch in {0..4}
+do
+
+${bin}/qsubshcom "  module load matlab/R2022a6 |;
+module load miniconda3/4.12.0 |;
+source /sw/auto/rocky8c/epyc3/software/Miniconda3/4.12.0/etc/profile.d/conda.sh |;
+conda activate clinicaEnv |;
+dat=\$(sed -n \"\${TASK_ID}{p;q}\" ${BIDS_DIR}/participants_batch${batch}) |;
+echo \${dat} |;
+ID=\$(echo \${dat} | cut -f 1 -d ' ' ) |;
+echo \${ID} |;
+if [ -d ${CAPS_DIR}/subjects/\${ID}/ses-M000/t1/spm/segmentation/normalized_space ] |;
+then |;
+nb=\$(ls ${CAPS_DIR}/subjects/\${ID}/ses-M000/t1/spm/segmentation/normalized_space | wc -l) |;
+if [ \${nb} -lt 6 ] |;
+then |;
+echo \"T1 t1-volume-tissue-segmentation - RUNNING\" |;
+colnames=\$(head -n 1 ${BIDS_DIR}/participants.tsv) |;
+echo \${colnames} \"session_id\" | tr ' ' '\t' > ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+echo \${dat} \"ses-M000\" | tr ' ' '\t' >> ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+head ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+clinica run t1-volume-tissue-segmentation ${BIDS_DIR} ${CAPS_DIR} -tsv ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv -np 1 -wd \${TMPDIR} |;
+rm ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+else |;
+echo \"T1 volume tissue segmentation output found - STOP\" |;
+fi |;
+else |;
+echo \"T1 t1-volume-tissue-segmentation - RUNNING\" |;
+colnames=\$(head -n 1 ${BIDS_DIR}/participants.tsv) |;
+echo \${colnames} \"session_id\" | tr ' ' '\t' > ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+echo \${dat} \"ses-M000\" | tr ' ' '\t' >> ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+head ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+clinica run t1-volume-tissue-segmentation ${BIDS_DIR} ${CAPS_DIR} -tsv ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv -np 1 -wd \${TMPDIR} |;
+rm ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+fi |;  " 1 4G UKB_T1vol_A_Clinica_batch${batch} 10:00:00 "-array=1-990 --account=a_mcrae --partition=general"
+
+done
+
+```
+
+# Step 3 - create Dartel template 
+
+> Clara selected 1000 and 600 individuals for DARTEL, we create the tsv files with ID, for CLINICA
+
+```{R, eval=F, message=FALSE}
+
+mkdir -p /path/to/working/directory/Neuroimaging_ML_project/7_Dartel1000
+mkdir -p /path/to/working/directory/Neuroimaging_ML_project/8_Dartel600
+
+final=fread("/path/to/working/directoryNeuroimaging_ML_project/6_bids_centered/participants.tsv")
+
+
+wd2="~/bunya/scratch/project_mnt/S0007/uqjjian3/Neuroimaging_ML_project"
+aa=fread(paste0(wd2, "/2_MD_case_control_matching/6_random_selection_DARTEL/Selected_seed27_matchingCTL_1to4_NNPS_Dartel_Selected_seed27_1000_pheno.txt" ))
+aa$participant_id=paste0("sub-UKB", aa$eid)
+aa$session_id="ses-M000"
+# Remove non usable T1
+aa=aa[which(aa$eid %in% final$source_id),]
+fwrite(aa[,c("participant_id", "session_id")], "/path/to/working/directoryNeuroimaging_ML_project/7_Dartel1000/dartel_participants.tsv", sep = "\t")
+
+
+
+
+wd2="~/bunya/scratch/project_mnt/S0007/uqjjian3/Neuroimaging_ML_project"
+aa=fread(paste0(wd2, "/2_MD_case_control_matching/6_random_selection_DARTEL/Selected_seed27_matchingCTL_1to4_NNPS_Dartel_Selected_seed27_600_pheno.txt" ))
+aa$participant_id=paste0("sub-UKB", aa$eid)
+aa$session_id="ses-M000"
+# Remove non usable T1
+aa=aa[which(aa$eid %in% final$source_id),]
+fwrite(aa[,c("participant_id", "session_id")], "/path/to/working/directoryNeuroimaging_ML_project/8_Dartel600/dartel_participants.tsv", sep = "\t")
+
+
+```
+
+> Run DARTEL template calculation
+
+```{bash, eval=F, message=FALSE}
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+DARTEL1000="/path/to/working/directory/Neuroimaging_ML_project/7_Dartel1000/"
+cd ${DARTEL1000}
+
+conda activate clinicaEnv
+
+${bin}/qsubshcom " module load matlab/R2022a6 |;
+module load miniconda3/4.12.0 |;
+source /sw/auto/rocky8c/epyc3/software/Miniconda3/4.12.0/etc/profile.d/conda.sh |;
+conda activate clinicaEnv |;
+clinica run t1-volume-create-dartel ${BIDS_DIR} ${CAPS_DIR} ukb1000 -tsv ${DARTEL1000}/dartel_participants.tsv -np 10 -wd \${TMPDIR} " 10 40G UKB_T1vol_B1_Clinica_DARTEL_1000 48:00:00 "--account=a_mcrae --partition=general "
+
+
+
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+DARTEL600="/path/to/working/directory/Neuroimaging_ML_project/8_Dartel600/"
+cd ${DARTEL600}
+
+conda activate clinicaEnv
+
+${bin}/qsubshcom " module load matlab/R2022a6 |;
+module load miniconda3/4.12.0 |;
+source /sw/auto/rocky8c/epyc3/software/Miniconda3/4.12.0/etc/profile.d/conda.sh |;
+conda activate clinicaEnv |;
+clinica run t1-volume-create-dartel ${BIDS_DIR} ${CAPS_DIR} ukb600 -tsv ${DARTEL600}/dartel_participants.tsv -np 10 -wd \${TMPDIR} " 10 40G UKB_T1vol_B1_Clinica_DARTEL_600 48:00:00 "--account=a_mcrae --partition=general "
+
+```
+
+
+
+# Check general progression in processing
+
+```{bash, eval=F, message=FALSE}
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+for TASK_ID in {2..5000}
+do
+
+dat=$(sed -n "${TASK_ID}{p;q}" ${BIDS_DIR}/participants.tsv) 
+ID=$(echo ${dat} | cut -f 1 -d ' ' ) 
+SESID="ses-M000" 
+# 
+
+# T1 volume - tissue segmentation
+if [ -d ${CAPS_DIR}/subjects/${ID}/${SESID}/t1/spm/segmentation/normalized_space ]
+then
+nb=$(ls ${CAPS_DIR}/subjects/${ID}/${SESID}/t1/spm/segmentation/normalized_space | wc -l) 
+if [ ${nb} -lt 6 ] 
+then 
+echo ${ID}_${SESID}_${TASK_ID}
+echo "T1 volume tissue segmentation output not found " 
+
+fi 
+else 
+echo ${ID}_${SESID}_${TASK_ID}
+echo "T1 volume tissue segmentation output not found " 
+fi
+done
+
+
+
+
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+for TASK_ID in {2..5000}
+do
+
+dat=$(sed -n "${TASK_ID}{p;q}" ${BIDS_DIR}/participants.tsv) 
+ID=$(echo ${dat} | cut -f 1 -d ' ' ) 
+SESID="ses-M000" 
+# T1 volume - tissue segmentation
+if [ ! -d /path/to/working/directory/Neuroimaging_ML_project/7_caps/subjects/sub-UKB1000156/ses-M000/t1/spm/segmentation/dartel_input ]
+then
+echo ${ID}_${SESID}_${TASK_ID}
+echo dartel_input folder not found
+fi
+done
+
+# all exist B1 is enough? Then which template was used??
+
+
+```
+
+
+> All good
+
+# B2 - register all subjects using DARTEL created
+
+>Output in 7_caps/subjects/sub-UKBXXXXX/ses-M000/t1/spm/dartel/
+
+
+
+```{bash, eval=F, message=FALSE}
+
+
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+cd ${CAPS_DIR}
+conda activate clinicaEnv
+
+
+for batch in 0
+do
+
+${bin}/qsubshcom "  module load matlab/R2022a6 |;
+module load miniconda3/4.12.0 |;
+source /sw/auto/rocky8c/epyc3/software/Miniconda3/4.12.0/etc/profile.d/conda.sh |;
+conda activate clinicaEnv |;
+dat=\$(sed -n \"\${TASK_ID}{p;q}\" ${BIDS_DIR}/participants_batch${batch}) |;
+echo \${dat} |;
+ID=\$(echo \${dat} | cut -f 1 -d ' ' ) |;
+echo \${ID} |;
+echo \"T1 t1-volume-tissue-segmentation - RUNNING\" |;
+colnames=\$(head -n 1 ${BIDS_DIR}/participants.tsv) |;
+echo \${colnames} \"session_id\" | tr ' ' '\t' > ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+echo \${dat} \"ses-M000\" | tr ' ' '\t' >> ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+head ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+if [ ! -f /path/to/working/directory/Neuroimaging_ML_project/7_caps/subjects/\${ID}/ses-M000/t1/spm/dartel/group-ukb1000/\${ID}_ses-M000_T1w_target-ukb1000_transformation-forward_deformation.nii.gz ] |;
+then |;
+clinica run t1-volume-register-dartel ${BIDS_DIR} ${CAPS_DIR} ukb1000 -tsv ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv -np 1 -wd \${TMPDIR} |;
+rm ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+fi |; " 1 4G UKB_T1vol_B2_dartel_reg${batch} 2:00:00 "-array=880-884 --account=a_mcrae --partition=general"
+
+done
+
+
+## CHech outputs
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+i=0
+for TASK_ID in {800..900}
+do
+
+dat=$(sed -n "${TASK_ID}{p;q}" ${BIDS_DIR}/participants.tsv) 
+ID=$(echo ${dat} | cut -f 1 -d ' ' ) 
+SESID="ses-M000" 
+# T1 volume - tissue segmentation
+if [ ! -d /path/to/working/directory/Neuroimaging_ML_project/7_caps/subjects/${ID}/ses-M000/t1/spm/dartel ]
+then
+echo ${ID}_${SESID}_${TASK_ID}
+echo dartel_input folder not found
+i=$((i+1))
+fi
+done
+
+
+
+```
+
+# C - DARTEL template to MNI
+
+
+
+```{bash, eval=F, message=FALSE}
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+cd ${CAPS_DIR}
+conda activate clinicaEnv
+
+for batch in 4
+do
+${bin}/qsubshcom "  module load matlab/R2022a6 |;
+module load miniconda3/4.12.0 |;
+source /sw/auto/rocky8c/epyc3/software/Miniconda3/4.12.0/etc/profile.d/conda.sh |;
+conda activate clinicaEnv |;
+SPM_HOME=\"/home/uqbcouvy/spm12\" |;
+dat=\$(sed -n \"\${TASK_ID}{p;q}\" ${BIDS_DIR}/participants_batch${batch}) |;
+echo \${dat} |;
+ID=\$(echo \${dat} | cut -f 1 -d ' ' ) |;
+echo \${ID} |;
+echo \"T1 t1-volume-tissue-segmentation - RUNNING\" |;
+colnames=\$(head -n 1 ${BIDS_DIR}/participants.tsv) |;
+echo \${colnames} \"session_id\" | tr ' ' '\t' > ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+echo \${dat} \"ses-M000\" | tr ' ' '\t' >> ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+head ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |;
+if [ ! -f /path/to/working/directory/Neuroimaging_ML_project/7_caps/subjects/\${ID}/ses-M000/t1/spm/dartel/group-ukb1000/\${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.nii.gz ] |;
+then |;
+clinica run t1-volume-dartel2mni ${BIDS_DIR} ${CAPS_DIR} ukb1000 -tsv ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv -np 1 -wd \${TMPDIR} |; 
+fi |;
+rm ${BIDS_DIR}/participants_${batch}_\${TASK_ID}.tsv |; " 1 4G UKB_T1vol_C_DartelToMNI_reg${batch} 2:00:00 "-array=250-260 --account=a_mcrae --partition=general"
+done
+
+
+
+```
+
+
+# Check final output
+
+```{bash, eval=F, message=FALSE}
+
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+i=0
+for TASK_ID in {2..5000}
+do
+
+dat=$(sed -n "${TASK_ID}{p;q}" ${BIDS_DIR}/participants.tsv) 
+ID=$(echo ${dat} | cut -f 1 -d ' ' ) 
+SESID="ses-M000" 
+# T1 volume - tissue segmentation
+if [ ! -f /path/to/working/directory/Neuroimaging_ML_project/7_caps/subjects/${ID}/ses-M000/t1/spm/dartel/group-ukb1000/${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.nii.gz ]
+then
+i=$((i+1))
+echo ${ID}_${SESID}_${TASK_ID}
+#echo file not found
+fi
+done
+
+echo $i # 763 missing after first run
+
+# all exist B1 is enough? Then which template was used??
+ls /path/to/working/directory/Neuroimaging_ML_project/7_caps/subjects/*/ses-M000/t1/spm/dartel/group-ukb1000/*${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549*Space_modulated-on_probability.nii.gz  | wc -l
+
+
+```
+
+
+
+<br><br>

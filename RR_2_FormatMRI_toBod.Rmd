@@ -1,0 +1,180 @@
+---
+title: "Convert voxel wise MRI data to BOD format for BLUP"
+author: "by [Baptiste Couvy-Duchesne] - `r format(Sys.time(), '%d %B %Y')`"
+output:
+  epuRate::PCTG:
+    toc: TRUE
+    code_folding: "show"
+---
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# You need these libraries to run this template:
+library(rmarkdown)    # install.packages("rmarkdown") 
+library(epuRate)      # devtools::install_github("holtzy/epuRate", force=TRUE)
+library(reticulate) # install.packages("reticulate") 
+
+```
+
+
+# Check CLINICA output
+
+```{bash, eval=F, message=FALSE}
+
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6.1_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7.1_caps" 
+
+/path/to/working/directory/Neuroimaging_ML_project/7.1_caps/subjects/${ID}/ses-M000/t1/spm/dartel/group-ukb1000/${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.nii.gz 
+# CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+
+
+i=0
+for TASK_ID in 2
+do
+dat=$(sed -n "${TASK_ID}{p;q}" ${BIDS_DIR}/participants.tsv) 
+ID=$(echo ${dat} | cut -f 1 -d ' ' ) 
+SESID="ses-M000" 
+# T1 volume - tissue segmentation
+if [ ! -f /path/to/working/directory/Neuroimaging_ML_project/7.1_caps/subjects/${ID}/ses-M000/t1/spm/dartel/group-ukb1000/${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.nii.gz ]
+then
+i=$((i+1))
+echo ${ID}_${SESID}_${TASK_ID}
+#echo file not found
+fi
+done
+
+echo $i 
+
+```
+
+# Convert nifti to text file
+
+```{bash, eval=F, message=FALSE}
+
+mkdir -p /path/to/working/directory/Neuroimaging_ML_project/9_txtBod
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+OUT_DIR="/path/to/working/directory/Neuroimaging_ML_project/9_txtBod" 
+
+
+cd ${OUT_DIR}
+
+for batch in {0..4}
+do
+${bin}/qsubshcom "  dat=\$(sed -n \"\${TASK_ID}{p;q}\" ${BIDS_DIR}/participants_batch${batch}) |;
+echo \${dat} |;
+ID=\$(echo \${dat} | cut -f 1 -d ' ' ) |;
+echo \${ID} |;
+echo \"Conversion from nifti to text - RUNNING\" |;
+if [ -f ${CAPS_DIR}/subjects/\${ID}/ses-M000/t1/spm/dartel/group-ukb1000/\${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.nii.gz ] |;
+then |;
+mkdir -p ${OUT_DIR}/\${ID} |;
+module load r/4.2.1-foss-2022a  |;
+Rscript --no-save "RR_ConvertNiftiToTsv.R" ${CAPS_DIR}/subjects/\${ID}/ses-M000/t1/spm/dartel/group-ukb1000/\${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.nii.gz ${OUT_DIR}/\${ID}/\${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.txt \${ID}
+fi |;
+ " 1 4G UKB_NiftiToTxt_TRAIN_batch${batch} 0:10:00 "-array=1-990 --account=a_mcrae --partition=general"
+done
+
+```
+
+
+# Combine into a single file
+
+```{bash, eval=F, message=FALSE}
+
+bin="/path/to/working/directory/bin"
+BIDS_DIR="/path/to/working/directory/Neuroimaging_ML_project/6_bids_centered" 
+CAPS_DIR="/path/to/working/directory/Neuroimaging_ML_project/7_caps" 
+OUT_DIR="/path/to/working/directory/Neuroimaging_ML_project/9_txtBod" 
+
+
+i=0
+for TASK_ID in {2..5001}
+do
+echo $i
+dat=$(sed -n "${TASK_ID}{p;q}" ${BIDS_DIR}/participants.tsv) 
+ID=$(echo ${dat} | cut -f 1 -d ' ' ) 
+SESID="ses-M000" 
+# T1 volume - tissue segmentation
+if [ -f ${OUT_DIR}/${ID}/${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.txt ]
+then
+if [ ${TASK_ID} == 2 ]
+then
+cp ${OUT_DIR}/${ID}/${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.txt ${OUT_DIR}/allVox
+else 
+tail -n +2 ${OUT_DIR}/${ID}/${ID}_ses-M000_T1w_segm-graymatter_space-Ixi549Space_modulated-on_probability.txt >> ${OUT_DIR}/allVox
+fi
+#echo file not found
+fi
+i=$((i+1))
+done
+
+######################
+bin="/path/to/working/directory/bin"
+OUT_DIR="/path/to/working/directory/Neuroimaging_ML_project/9_txtBod" 
+cd ${OUT_DIR}
+
+${bin}/qsubshcom " ${bin}/osca_200220 --efile ${OUT_DIR}/allVox --make-bod --out  ${OUT_DIR}/allVox " 1 80G ${hemi}_${moda}_MakeBod 10:00:00 "--account=a_mcrae --partition=general" 
+
+
+```
+
+# Identify voxels with small mean and variance - for exclusion
+
+```{bash, eval=F, message=FALSE}
+
+bin="/path/to/working/directory/bin"
+OUT_DIR="/path/to/working/directory/Neuroimaging_ML_project/9.1_txtBod" 
+cd ${OUT_DIR}
+${bin}/qsubshcom " ${bin}/osca_200220 --befile ${OUT_DIR}/allVox --get-mean --get-variance --out ${OUT_DIR}/allVox_meanvar " 1 50G ${hemi}_${moda}_MeanVar 10:00:00 "--account=a_mcrae --partition=general" 
+
+
+
+bin="/path/to/working/directory/bin"
+OUT_DIR="/path/to/working/directory/Neuroimaging_ML_project/9_txtBod" 
+cd ${OUT_DIR}
+${bin}/qsubshcom " ${bin}/osca_200220 --befile ${OUT_DIR}/allVox --get-mean --get-variance --out ${OUT_DIR}/allVox_meanvar " 1 80G ${hemi}_${moda}_MeanVar 10:00:00 "--account=a_mcrae --partition=general" 
+
+
+
+```
+
+# Remove unusable voxels - from BOD files
+
+> list of voxels to exclude created and checked in RR_4
+
+```{bash, eval=F, message=FALSE}
+
+
+bin="/path/to/working/directory/bin"
+wd="/path/to/working/directory/Neuroimaging_ML_project/"
+OUT_DIR="/path/to/working/directory/Neuroimaging_ML_project/9_txtBod" 
+cd ${wd}
+${bin}/qsubshcom " ${bin}/osca_200220 --befile /path/to/working/directory/Neuroimaging_ML_project/9_txtBod/allVox --exclude-probe  ${wd}/voxels2Exclude_meanVar.txt --make-bod --out /path/to/working/directory/Neuroimaging_ML_project/9_txtBod/allVox_voxQC |;  
+ ${bin}/osca_200220 --befile /path/to/working/directory/Neuroimaging_ML_project/9.1_txtBod/allVox --exclude-probe  ${wd}/voxels2Exclude_meanVar.txt --make-bod --out /path/to/working/directory/Neuroimaging_ML_project/9.1_txtBod/allVox_voxQC " 1 80G RemoveVoxels 10:00:00 "--account=a_mcrae --partition=general" 
+
+
+```
+
+# Write a txt format for combat in R - or other purpose
+
+
+```{bash, eval=F, message=FALSE}
+
+bin="/path/to/working/directory/bin"
+wd="/path/to/working/directory/Neuroimaging_ML_project/"
+cd ${wd}
+
+
+${bin}/qsubshcom " ${bin}/osca_200220 --befile /path/to/working/directory/Neuroimaging_ML_project/9.1_txtBod/allVox_voxQC --make-efile --out /path/to/working/directory/Neuroimaging_ML_project/9.1_txtBod/allVox_voxQC.txt  " 1 80G WriteAsTxt 10:00:00 "--account=a_mcrae --partition=general" 
+
+
+```
+
+
+
+<br><br>
